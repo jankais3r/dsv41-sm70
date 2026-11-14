@@ -1,0 +1,355 @@
+name: Build strata-dsv41 for sm_70
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-dsv41-sm70.yml"
+
+permissions:
+  contents: read
+
+env:
+  # Change this only if you deliberately want a different source.
+  SOURCE_REPOSITORY: rafal-prasal/Strata
+  SOURCE_REF: FEATURE/dsv41-pascal
+
+jobs:
+  resolve-source:
+    name: Resolve source commit
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Check out the requested fork and branch
+        uses: actions/checkout@v4
+        with:
+          repository: rafal-prasal/Strata
+          ref: FEATURE/dsv41-pascal
+          path: source
+          persist-credentials: false
+
+      - name: Record exact commit
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C source rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building source commit: $sha"
+
+  linux:
+    name: Linux x86-64 / CUDA 12.9 / sm_70
+    needs: resolve-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    container:
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+
+    steps:
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            git \
+            cmake \
+            ninja-build \
+            python3 \
+            python3-cryptography \
+            binutils \
+            libgomp1 \
+            libatomic1
+          nvcc --version
+          cmake --version
+
+      - name: Check out the resolved source commit
+        uses: actions/checkout@v4
+        with:
+          repository: rafal-prasal/Strata
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          path: source
+          persist-credentials: false
+
+      - name: Configure and build
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake -S . -B build-dsv41 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTRATA_ENABLE_CUDA=ON \
+            -DSTRATA_BUILD_TESTS=OFF \
+            -DSTRATA_BUILD_DSV41=ON \
+            -DSTRATA_NATIVE_EXPERTS=ON \
+            -DSTRATA_PORTABLE=ON \
+            -DSTRATA_EXPERIMENTAL_SM60=ON \
+            '-DCMAKE_CUDA_ARCHITECTURES=70-real' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_SKIP_BUILD_RPATH=OFF \
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+
+          cmake --build build-dsv41 \
+            --target strata-dsv41 \
+            --parallel 4
+
+          test -x build-dsv41/strata-dsv41
+
+      - name: Check that the executable contains sm_70 code
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cuobjdump --list-elf build-dsv41/strata-dsv41 \
+            > cuobjdump-elf.txt
+
+          cat cuobjdump-elf.txt
+
+          if ! grep -q 'sm_70' cuobjdump-elf.txt; then
+            echo "ERROR: cuobjdump did not find an sm_70 ELF image."
+            exit 1
+          fi
+
+      - name: Collect libraries and create tarball
+        working-directory: source
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve-source.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          # Read the engine version from the checked-out CMake project.
+          version="$(
+            python3 -c '
+          import pathlib, re
+          text = pathlib.Path("CMakeLists.txt").read_text(encoding="utf-8")
+          match = re.search(
+              r"project\s*\(\s*strata\s+VERSION\s+([0-9.]+)",
+              text,
+              re.IGNORECASE,
+          )
+          if not match:
+              raise SystemExit("Could not determine the Strata version")
+          print(match.group(1))
+          '
+          )"
+
+          echo "Engine version: $version"
+          mkdir -p stage packages dist
+
+          cp build-dsv41/strata-dsv41 stage/
+          cp cuobjdump-elf.txt dist/
+          printf '%s\n' "$SOURCE_COMMIT" > dist/SOURCE_COMMIT.txt
+
+          # The collector copies non-system CUDA libraries and records
+          # the system libraries that the target machine must provide.
+          python3 packaging/collect_libs.py \
+            --binary build-dsv41/strata-dsv41 \
+            --search /usr/local/cuda/lib64 \
+            --out stage \
+            --also 'libcublasLt.so*'
+
+          # This produces a package directory with an unsigned manifest.
+          python3 packaging/package_engine.py \
+            --src stage \
+            --backend cuda \
+            --version "$version" \
+            --platform linux-x86_64 \
+            --variant cuda12 \
+            --arch sm_70 \
+            --build-id "$SOURCE_COMMIT" \
+            --entrypoint strata-dsv41 \
+            --include SYSTEM-LIBS.txt \
+            --out packages
+
+          package_dir="packages/${version}-linux-x86_64-cuda-cuda12"
+
+          python3 packaging/package_engine.py \
+            --verify "$package_dir"
+
+          # Creates the release-style tar.gz and a feed-entry JSON file.
+          python3 packaging/feed_tool.py pack-engine \
+            "$package_dir" \
+            --out dist \
+            --prefix strata-dsv41 \
+            --url-prefix=
+
+          (
+            cd dist
+            sha256sum ./*.tar.gz > SHA256SUMS.txt
+            ls -lh
+          )
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-dsv41-linux-x86_64-cuda12-sm70
+          path: |
+            source/dist/*.tar.gz
+            source/dist/*.entry.json
+            source/dist/SHA256SUMS.txt
+            source/dist/SOURCE_COMMIT.txt
+            source/dist/cuobjdump-elf.txt
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86-64 / CUDA 12.9 / sm_70
+    needs: resolve-source
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out the resolved source commit
+        uses: actions/checkout@v4
+        with:
+          repository: rafal-prasal/Strata
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CUDA 12.9.1
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.9.1"
+          method: local
+
+      - name: Install Python packaging dependency
+        shell: pwsh
+        run: |
+          python -m pip install cryptography
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+
+      - name: Configure and build
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          nvcc --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc is unavailable" }
+
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw "CMake is unavailable" }
+
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw "Ninja is unavailable" }
+
+          cmake -S . -B build-dsv41 -G Ninja `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DSTRATA_ENABLE_CUDA=ON" `
+            "-DSTRATA_BUILD_TESTS=OFF" `
+            "-DSTRATA_BUILD_DSV41=ON" `
+            "-DSTRATA_NATIVE_EXPERTS=ON" `
+            "-DSTRATA_PORTABLE=ON" `
+            "-DSTRATA_EXPERIMENTAL_SM60=ON" `
+            "-DCMAKE_CUDA_ARCHITECTURES=70-real" `
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH" `
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe"
+
+          if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed" }
+
+          cmake --build build-dsv41 --target strata-dsv41 --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+          if (-not (Test-Path "build-dsv41/strata-dsv41.exe")) {
+            throw "The expected executable was not produced"
+          }
+
+      - name: Check that the executable contains sm_70 code
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dump = & cuobjdump --list-elf "build-dsv41/strata-dsv41.exe"
+          if ($LASTEXITCODE -ne 0) { throw "cuobjdump failed" }
+
+          $dump | Set-Content -Encoding utf8 "cuobjdump-elf.txt"
+          $dump | Write-Host
+
+          if (-not (($dump -join "`n") -match "sm_70")) {
+            throw "cuobjdump did not find an sm_70 ELF image"
+          }
+
+      - name: Collect DLLs and create tarball
+        working-directory: source
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve-source.outputs.commit }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cmakeText = Get-Content -Raw "CMakeLists.txt"
+          if ($cmakeText -notmatch '(?i)project\s*\(\s*strata\s+VERSION\s+([0-9.]+)') {
+            throw "Could not determine the Strata version"
+          }
+          $version = $Matches[1]
+          Write-Host "Engine version: $version"
+
+          New-Item -ItemType Directory -Force stage, packages, dist |
+            Out-Null
+
+          Copy-Item "build-dsv41/strata-dsv41.exe" "stage/"
+          Copy-Item "cuobjdump-elf.txt" "dist/"
+          Set-Content -Encoding ascii "dist/SOURCE_COMMIT.txt" $env:SOURCE_COMMIT
+
+          # package_engine.py scans PE imports and copies missing DLLs
+          # from CUDA_PATH and PATH into the package.
+          python packaging/package_engine.py `
+            --src stage `
+            --backend cuda `
+            --version $version `
+            --platform windows-x86_64 `
+            --variant cuda12 `
+            --arch sm_70 `
+            --build-id $env:SOURCE_COMMIT `
+            --entrypoint strata-dsv41.exe `
+            --out packages
+
+          if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
+
+          $packageDir = "packages/$version-windows-x86_64-cuda-cuda12"
+
+          python packaging/package_engine.py --verify $packageDir
+          if ($LASTEXITCODE -ne 0) { throw "Package verification failed" }
+
+          python packaging/feed_tool.py pack-engine `
+            $packageDir `
+            --out dist `
+            --prefix strata-dsv41 `
+            --url-prefix=
+
+          if ($LASTEXITCODE -ne 0) { throw "Tarball creation failed" }
+
+          $archives = @(Get-ChildItem "dist/*.tar.gz")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one tar.gz archive"
+          }
+
+          $hash = Get-FileHash -Algorithm SHA256 $archives[0].FullName
+          "$($hash.Hash.ToLower())  $($archives[0].Name)" |
+            Set-Content -Encoding ascii "dist/SHA256SUMS.txt"
+
+          Get-ChildItem dist
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-dsv41-windows-x86_64-cuda12-sm70
+          path: |
+            source/dist/*.tar.gz
+            source/dist/*.entry.json
+            source/dist/SHA256SUMS.txt
+            source/dist/SOURCE_COMMIT.txt
+            source/dist/cuobjdump-elf.txt
+          if-no-files-found: error
