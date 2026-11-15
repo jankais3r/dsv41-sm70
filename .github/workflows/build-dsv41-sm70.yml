@@ -216,6 +216,44 @@ jobs:
           path: source
           persist-credentials: false
 
+      - name: Patch MoeWin kernel for Pascal
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $file = "src/dsv41/vendor/moe_win.cu"
+          $text = [System.IO.File]::ReadAllText(
+            (Resolve-Path $file).Path
+          )
+
+          $pattern = '\bconst\s+__grid_constant__\s+MoeWin\s+w\b'
+          $matchesFound = [regex]::Matches($text, $pattern)
+
+          if ($matchesFound.Count -ne 1) {
+            throw "Expected exactly one MoeWin grid-constant parameter; found $($matchesFound.Count). Check whether the source has changed."
+          }
+
+          $patched = [regex]::Replace(
+            $text,
+            $pattern,
+            "const MoeWin w"
+          )
+
+          # Write UTF-8 without a byte-order mark.
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $file).Path,
+            $patched,
+            $utf8
+          )
+
+          # Save the actual change alongside the build artifacts.
+          git diff -- $file | Out-File -Encoding utf8 "moe-win-sm61.patch"
+          if ($LASTEXITCODE -ne 0) { throw "Could not generate patch" }
+
+          Get-Content "moe-win-sm61.patch"
+
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -356,4 +394,5 @@ jobs:
             source/dist/SHA256SUMS.txt
             source/dist/SOURCE_COMMIT.txt
             source/dist/cuobjdump-elf.txt
+            source/moe-win-sm61.patch
           if-no-files-found: error
