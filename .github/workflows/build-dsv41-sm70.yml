@@ -90,7 +90,7 @@ jobs:
             -DSTRATA_NATIVE_EXPERTS=ON \
             -DSTRATA_PORTABLE=ON \
             -DSTRATA_EXPERIMENTAL_SM60=ON \
-            '-DCMAKE_CUDA_ARCHITECTURES=70-real' \
+            '-DCMAKE_CUDA_ARCHITECTURES=61-real;70-real' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_SKIP_BUILD_RPATH=OFF \
             '-DCMAKE_INSTALL_RPATH=$ORIGIN'
@@ -101,7 +101,7 @@ jobs:
 
           test -x build-dsv41/strata-dsv41
 
-      - name: Check that the executable contains sm_70 code
+      - name: Check that the executable contains sm_61 and sm_70 code
         working-directory: source
         shell: bash
         run: |
@@ -112,10 +112,12 @@ jobs:
 
           cat cuobjdump-elf.txt
 
-          if ! grep -q 'sm_70' cuobjdump-elf.txt; then
-            echo "ERROR: cuobjdump did not find an sm_70 ELF image."
-            exit 1
-          fi
+          for arch in sm_61 sm_70; do
+            if ! grep -q "$arch" cuobjdump-elf.txt; then
+              echo "ERROR: cuobjdump did not find a $arch ELF image."
+              exit 1
+            fi
+          done
 
       - name: Collect libraries and create tarball
         working-directory: source
@@ -163,7 +165,7 @@ jobs:
             --version "$version" \
             --platform linux-x86_64 \
             --variant cuda12 \
-            --arch sm_70 \
+            --arch sm_61 --arch sm_70 \
             --build-id "$SOURCE_COMMIT" \
             --entrypoint strata-dsv41 \
             --include SYSTEM-LIBS.txt \
@@ -190,7 +192,7 @@ jobs:
       - name: Upload Linux archive
         uses: actions/upload-artifact@v4
         with:
-          name: strata-dsv41-linux-x86_64-cuda12-sm70
+          name: strata-dsv41-linux-x86_64-cuda12-sm61-sm70
           path: |
             source/dist/*.tar.gz
             source/dist/*.entry.json
@@ -252,7 +254,7 @@ jobs:
             "-DSTRATA_NATIVE_EXPERTS=ON" `
             "-DSTRATA_PORTABLE=ON" `
             "-DSTRATA_EXPERIMENTAL_SM60=ON" `
-            "-DCMAKE_CUDA_ARCHITECTURES=70-real" `
+            "-DCMAKE_CUDA_ARCHITECTURES=61-real;70-real" `
             "-DCUDAToolkit_ROOT=$env:CUDA_PATH" `
             "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe"
 
@@ -265,7 +267,7 @@ jobs:
             throw "The expected executable was not produced"
           }
 
-      - name: Check that the executable contains sm_70 code
+      - name: Check that the executable contains sm_61 and sm_70 code
         working-directory: source
         shell: pwsh
         run: |
@@ -277,8 +279,10 @@ jobs:
           $dump | Set-Content -Encoding utf8 "cuobjdump-elf.txt"
           $dump | Write-Host
 
-          if (-not (($dump -join "`n") -match "sm_70")) {
-            throw "cuobjdump did not find an sm_70 ELF image"
+          foreach ($arch in @("sm_61", "sm_70")) {
+            if (-not (($dump -join "`n") -match $arch)) {
+              throw "cuobjdump did not find an $arch ELF image"
+            }
           }
 
       - name: Collect DLLs and create tarball
@@ -311,7 +315,7 @@ jobs:
             --version $version `
             --platform windows-x86_64 `
             --variant cuda12 `
-            --arch sm_70 `
+            --arch sm_61 --arch sm_70 `
             --build-id $env:SOURCE_COMMIT `
             --entrypoint strata-dsv41.exe `
             --out packages
@@ -345,7 +349,7 @@ jobs:
       - name: Upload Windows archive
         uses: actions/upload-artifact@v4
         with:
-          name: strata-dsv41-windows-x86_64-cuda12-sm70
+          name: strata-dsv41-windows-x86_64-cuda12-sm61-sm70
           path: |
             source/dist/*.tar.gz
             source/dist/*.entry.json
